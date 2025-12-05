@@ -1,0 +1,10 @@
+# Entorno
+.env
+
+# Directorios de caché
+__pycache__/
+*.pyc
+
+# Archivos de Jupyter/logs (opcional)
+.ipynb_checkpoints
+*.log
