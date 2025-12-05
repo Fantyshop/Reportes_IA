@@ -1,0 +1,167 @@
+import os
+import time
+import base64
+import requests
+from supabase import create_client, Client
+from openai import OpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# ----------------------------------------------------
+# 1. CONFIGURACIÓN E INICIALIZACIÓN (Usando Variables de Entorno de Railway)
+# ----------------------------------------------------
+
+# Inicializar clientes
+# Estas variables se configuran directamente en Railway como "Secrets"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+BUCKET_NAME = os.environ.get("SUPABASE_BUCKET", "whatsapp-media")
+
+# Inicializar clientes
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Configuración de LangChain para el 'chunking'
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", "!", "?", " ", ""],
+)
+
+# ----------------------------------------------------
+# 2. FUNCIONES DE PROCESAMIENTO
+# ----------------------------------------------------
+
+def encode_image(image_url: str):
+    """Descarga una imagen desde Supabase Storage y la codifica a Base64."""
+    try:
+        # Nota: La URL debe ser accesible (pública o usando la clave de servicio en la petición)
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status() # Lanza un error para códigos de estado HTTP malos
+
+        # Codificar binario a Base64
+        return base64.b64encode(response.content).decode('utf-8')
+    except Exception as e:
+        print(f"Error al descargar o codificar imagen {image_url}: {e}")
+        return None
+
+def analyze_and_get_description(image_base64: str, file_type: str) -> str:
+    """Usa GPT-4o para obtener una descripción textual de la imagen."""
+    
+    # Adaptar el prompt para el análisis de imágenes
+    prompt = (
+        "Actúa como un analista de inteligencia de negocios. Describe concisamente la imagen. "
+        "Identifica cualquier texto relevante, avance de proyecto (si aplica), o problema visible. "
+        "El objetivo es convertir la imagen en contexto textual para un reporte ejecutivo. Máximo 50 palabras."
+    )
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o", # O el modelo multimodal de tu preferencia (Ej: Claude 3.5 Sonnet)
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{file_type};base64,{image_base64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=100,
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print(f"Error en la API de OpenAI para la imagen: {e}")
+        return "ERROR: No se pudo generar descripción de la imagen."
+
+def create_and_upload_embedding(content: str, record_id: int):
+    """Genera el embedding y actualiza el registro en Supabase."""
+    
+    # 1. Generar Embedding
+    response = openai_client.embeddings.create(
+        input=content,
+        model="text-embedding-3-small" # Un modelo de 1536 dimensiones, muy eficiente y barato
+    )
+    embedding_vector = response.data[0].embedding
+
+    # 2. Actualizar Supabase (usando la notación de array de Python)
+    data, count = supabase.from('mensajes_analisis').update(
+        {
+            'embedding': embedding_vector,
+            # Campo de control para saber que ya fue procesado
+            'procesado_ia': True 
+        }
+    ).eq('id', record_id).execute()
+
+    if data:
+        print(f"✔️ Actualizado ID {record_id} con embedding.")
+    else:
+        print(f"❌ Error al actualizar ID {record_id}.")
+
+# ----------------------------------------------------
+# 3. LÓGICA PRINCIPAL DEL PROCESO
+# ----------------------------------------------------
+
+def main_processor():
+    print("--- 🚀 Iniciando Proceso de Vectorización y OCR ---")
+
+    # 1. Buscar registros sin vectorizar ni procesar
+    # Agrega 'procesado_ia' en tu tabla para evitar reprocesar
+    # Asume que ya tienes una columna `procesado_ia` BOOLEAN en `mensajes_analisis`
+    # Si no la tienes, puedes buscar donde 'embedding' es NULL
+    response = supabase.from('mensajes_analisis').select("*").is_('embedding', None).order('fecha_hora', desc=False).limit(50).execute()
+    
+    pending_records = response.data
+
+    if not pending_records:
+        print("✅ No hay nuevos registros para procesar.")
+        return
+
+    print(f"🔎 Encontrados {len(pending_records)} registros pendientes.")
+
+    for record in pending_records:
+        record_id = record['id']
+        final_content = record['contenido_texto'] or "" # Empezar con el texto crudo
+
+        # A. Si es una imagen, hacer OCR Multimodal
+        if record['es_imagen'] and record['url_storage']:
+            print(f"   [ID {record_id}] Procesando imagen...")
+            
+            # Nota: Necesitas saber el tipo de archivo (mime-type)
+            file_type = "image/jpeg" # Asumir JPEG o inferir del nombre/metadata
+            
+            base64_img = encode_image(record['url_storage'])
+            
+            if base64_img:
+                description = analyze_and_get_description(base64_img, file_type)
+                # Combinar la descripción de la imagen con el texto del mensaje original
+                final_content = f"{final_content}\n[ANÁLISIS DE IMAGEN]: {description}"
+                print(f"   [ID {record_id}] Descripción: {description[:40]}...")
+
+
+        # B. Procesamiento de Texto (Chunking) y Vectorización
+        
+        # Opcional: Si el texto es muy largo, LangChain lo divide
+        # En este caso de chats cortos, lo simplificamos a vectorizar el contenido unificado
+        
+        if final_content:
+            create_and_upload_embedding(final_content, record_id)
+        else:
+             print(f"   [ID {record_id}] Contenido vacío. Saltando.")
+
+
+# Si vas a correr esto como un Cron Job o un servicio "Always On"
+if __name__ == "__main__":
+    # La mejor práctica en Railway es correr esto en un bucle si es un servicio 24/7
+    # O usar una función Serverless para correrlo una vez cada N minutos.
+    # Para un servicio continuo:
+    while True:
+        main_processor()
+        print("😴 Durmiendo 30 segundos antes de la siguiente búsqueda...")
+        time.sleep(30)
