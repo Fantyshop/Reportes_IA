@@ -6,6 +6,7 @@ from urllib.parse import unquote
 from io import BytesIO
 from supabase import create_client, Client
 from openai import OpenAI
+import tempfile
 
 # Bibliotecas para procesamiento de documentos
 import PyPDF2
@@ -13,6 +14,10 @@ import pdfplumber
 from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
+
+# Bibliotecas para procesamiento de videos
+import cv2
+from PIL import Image
 
 # ----------------------------------------------------
 # 1. CONFIGURACIÓN E INICIALIZACIÓN
@@ -30,6 +35,10 @@ if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, OPENAI_API_KEY]):
 # Inicializar clientes
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Configuración de procesamiento de videos
+VIDEO_FRAME_INTERVAL_SECONDS = 3  # Extraer un frame cada N segundos
+VIDEO_MAX_FRAMES = 10  # Máximo de frames a analizar por video (para limitar costos)
 
 # Mapeo de MIME types a extensiones
 MIME_TYPE_MAP = {
@@ -51,6 +60,7 @@ MIME_TYPE_MAP = {
 
 SUPPORTED_IMAGE_FORMATS = ['png', 'jpeg', 'jpg', 'gif', 'webp']
 SUPPORTED_DOCUMENT_FORMATS = ['pdf', 'docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt']
+SUPPORTED_VIDEO_FORMATS = ['mp4', 'mov', 'avi', 'mkv', 'webm']
 
 # ----------------------------------------------------
 # 2. FUNCIONES DE UTILIDAD
@@ -67,9 +77,28 @@ def clean_url(url: str) -> str:
 def get_file_extension_from_url(url: str) -> str:
     """Extrae la extensión del archivo desde la URL."""
     url_lower = url.lower()
-    for ext in SUPPORTED_IMAGE_FORMATS + SUPPORTED_DOCUMENT_FORMATS:
+    
+    # Intentar extraer extensión del final de la URL antes de parámetros
+    # Ejemplo: file.pdf?token=xxx o file_lid.xlsx
+    if '?' in url_lower:
+        url_lower = url_lower.split('?')[0]
+    
+    # Buscar patrones comunes: _lid.ext, _false.ext, .ext
+    import re
+    
+    # Patrón para encontrar extensiones comunes
+    all_extensions = SUPPORTED_IMAGE_FORMATS + SUPPORTED_DOCUMENT_FORMATS + SUPPORTED_VIDEO_FORMATS
+    pattern = r'[_\.](' + '|'.join(all_extensions) + r')(?:[_\?]|$)'
+    match = re.search(pattern, url_lower)
+    
+    if match:
+        return match.group(1)
+    
+    # Fallback: buscar extensión simple
+    for ext in all_extensions:
         if f".{ext}" in url_lower:
             return ext
+    
     return None
 
 def get_file_metadata_from_storage(url: str) -> dict:
@@ -386,6 +415,168 @@ def process_powerpoint(url: str) -> str:
         return None
 
 # ----------------------------------------------------
+# 7B. PROCESAMIENTO DE VIDEOS
+# ----------------------------------------------------
+
+def extract_frames_from_video(file_content: bytes, interval_seconds: int = 3, max_frames: int = 10) -> list:
+    """
+    Extrae frames de un video cada N segundos.
+    
+    Args:
+        file_content: Contenido del video en bytes
+        interval_seconds: Intervalo en segundos entre frames (default: 3)
+        max_frames: Máximo número de frames a extraer (default: 10)
+    
+    Returns:
+        Lista de imágenes PIL
+    """
+    try:
+        # Guardar temporalmente el video
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+            tmp_file.write(file_content)
+            tmp_path = tmp_file.name
+        
+        # Abrir video con OpenCV
+        video = cv2.VideoCapture(tmp_path)
+        
+        # Obtener información del video
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = video.get(cv2.CAP_PROP_FPS)
+        duration = total_frames / fps if fps > 0 else 0
+        
+        print(f"      📹 Video: {duration:.1f}s, FPS: {fps:.1f}, {total_frames} frames totales")
+        
+        frames = []
+        
+        if total_frames > 0 and fps > 0:
+            # Calcular frames a extraer cada N segundos
+            frames_per_interval = int(fps * interval_seconds)
+            
+            # Calcular posiciones de frames
+            frame_positions = []
+            current_frame = 0
+            
+            while current_frame < total_frames and len(frame_positions) < max_frames:
+                frame_positions.append(current_frame)
+                current_frame += frames_per_interval
+            
+            print(f"      🎞️ Extrayendo {len(frame_positions)} frames (cada {interval_seconds}s)...")
+            
+            # Extraer frames
+            for idx, frame_pos in enumerate(frame_positions):
+                video.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+                ret, frame = video.read()
+                
+                if ret:
+                    # Convertir de BGR (OpenCV) a RGB (PIL)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(frame_rgb)
+                    frames.append(pil_image)
+                    
+                    # Calcular timestamp para referencia
+                    timestamp = frame_pos / fps
+                    print(f"         ✓ Frame {idx+1} extraído (t={timestamp:.1f}s)")
+        
+        video.release()
+        
+        # Eliminar archivo temporal
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        
+        return frames
+        
+    except Exception as e:
+        print(f"❌ Error extrayendo frames del video: {e}")
+        return []
+
+def analyze_video_frame(frame_image: Image, frame_number: int, timestamp: float) -> str:
+    """Analiza un frame de video usando GPT-4o."""
+    
+    prompt = (
+        f"Analiza este frame de un video de WhatsApp relacionado con operaciones mineras (timestamp: {timestamp:.1f}s). "
+        "Describe lo que ves: equipos, operaciones, personas, problemas, condiciones, o cualquier elemento relevante. "
+        "Si hay texto visible (pantallas, letreros, medidores), transcríbelo. "
+        "Si identificas un problema o situación de riesgo, menciónalo. "
+        "Sé conciso y específico. Máximo 100 palabras."
+    )
+    
+    try:
+        # Convertir PIL Image a base64
+        buffer = BytesIO()
+        frame_image.save(buffer, format='JPEG', quality=85)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=200,
+        )
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        print(f"❌ Error analizando frame con IA: {e}")
+        return None
+
+def process_video(url: str) -> str:
+    """
+    Procesa un video extrayendo y analizando frames según configuración.
+    Usa VIDEO_FRAME_INTERVAL_SECONDS y VIDEO_MAX_FRAMES definidos globalmente.
+    """
+    try:
+        print(f"      🎬 Descargando video...")
+        file_content = download_file(url)
+        if not file_content:
+            return None
+        
+        # Extraer frames según configuración
+        frames = extract_frames_from_video(
+            file_content, 
+            interval_seconds=VIDEO_FRAME_INTERVAL_SECONDS,
+            max_frames=VIDEO_MAX_FRAMES
+        )
+        
+        if not frames:
+            return "[Video sin frames extraíbles]"
+        
+        print(f"      🤖 Analizando {len(frames)} frames con IA...")
+        
+        # Analizar cada frame
+        frame_analyses = []
+        for idx, frame in enumerate(frames):
+            timestamp = idx * VIDEO_FRAME_INTERVAL_SECONDS
+            analysis = analyze_video_frame(frame, idx + 1, timestamp)
+            if analysis:
+                frame_analyses.append(f"[t={timestamp}s] {analysis}")
+                print(f"         ✓ Frame {idx+1} analizado")
+        
+        if frame_analyses:
+            combined_analysis = "\n".join(frame_analyses)
+            return f"[ANÁLISIS DE VIDEO - {len(frames)} frames cada {VIDEO_FRAME_INTERVAL_SECONDS}s]:\n{combined_analysis}"
+        else:
+            return "[Video procesado pero sin análisis disponible]"
+            
+    except Exception as e:
+        print(f"❌ Error procesando video: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ----------------------------------------------------
 # 8. PROCESADOR UNIVERSAL DE ARCHIVOS
 # ----------------------------------------------------
 
@@ -397,6 +588,10 @@ def process_file(url: str, file_extension: str) -> str:
     # Imágenes
     if file_extension in SUPPORTED_IMAGE_FORMATS:
         return process_image(url, file_extension)
+    
+    # Videos
+    elif file_extension in SUPPORTED_VIDEO_FORMATS:
+        return process_video(url)
     
     # PDFs
     elif file_extension == 'pdf':
@@ -509,6 +704,7 @@ def main_processor():
                         print(f"   [ID {record_id}] ⚠️ No se pudo procesar el archivo")
                 else:
                     print(f"   [ID {record_id}] ⚠️ Tipo de archivo no reconocido")
+                    print(f"   [ID {record_id}] 🔗 URL: {file_url[:100]}...")  # Mostrar primeros 100 caracteres
 
             # B. Vectorización del contenido final
             if final_content.strip():
@@ -545,6 +741,8 @@ if __name__ == "__main__":
     print(f"📁 Bucket: {BUCKET_NAME}")
     print(f"📄 Formatos soportados:")
     print(f"   • Imágenes: {', '.join(SUPPORTED_IMAGE_FORMATS)}")
+    print(f"   • Videos: {', '.join(SUPPORTED_VIDEO_FORMATS)}")
+    print(f"     └─ Configuración: 1 frame cada {VIDEO_FRAME_INTERVAL_SECONDS}s (máx {VIDEO_MAX_FRAMES} frames)")
     print(f"   • Documentos: {', '.join(SUPPORTED_DOCUMENT_FORMATS)}")
     print("="*70)
     print("⏰ El servicio verifica nuevos registros cada 30 segundos")
