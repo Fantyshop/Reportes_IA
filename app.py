@@ -50,7 +50,7 @@ def analyze_and_get_description(image_base64: str, file_type: str) -> str:
     
     # Adaptar el prompt para el análisis de imágenes
     prompt = (
-        "Actúa como un analista de inteligencia de negocios. Describe concisamente la imagen. "
+        "Actúa como un analista experto de inteligencia de negocios en sector minero. Describe concisamente la imagen. "
         "Identifica cualquier texto relevante, avance de proyecto (si aplica), o problema visible. "
         "El objetivo es convertir la imagen en contexto textual para un reporte ejecutivo. Máximo 50 palabras."
     )
