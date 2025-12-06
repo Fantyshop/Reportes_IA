@@ -91,7 +91,7 @@ def create_and_upload_embedding(content: str, record_id: int):
     embedding_vector = response.data[0].embedding
 
     # 2. Actualizar Supabase (usando la notación de array de Python)
-    data, count = supabase.from('mensajes_analisis').update(
+    response = supabase.from('mensajes_analisis').update(
         {
             'embedding': embedding_vector,
             # Campo de control para saber que ya fue procesado
@@ -99,7 +99,7 @@ def create_and_upload_embedding(content: str, record_id: int):
         }
     ).eq('id', record_id).execute()
 
-    if data:
+    if response.data:
         print(f"✔️ Actualizado ID {record_id} con embedding.")
     else:
         print(f"❌ Error al actualizar ID {record_id}.")
