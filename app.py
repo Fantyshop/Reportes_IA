@@ -734,10 +734,10 @@ def main_processor():
 # ----------------------------------------------------
 
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("🔧 SERVICIO DE VECTORIZACIÓN MULTI-FORMATO")
     print("="*70)
-    print(f"🌐 Supabase URL: {SUPABASE_URL}")
+    print("🔧 Servicio de Vectorización Multi-Formato")
+    print("="*70)
+    print(f"🌐 Conectado a Supabase: {SUPABASE_URL}")
     print(f"📁 Bucket: {BUCKET_NAME}")
     print(f"📄 Formatos soportados:")
     print(f"   • Imágenes: {', '.join(SUPPORTED_IMAGE_FORMATS)}")
@@ -745,6 +745,7 @@ if __name__ == "__main__":
     print(f"     └─ Configuración: 1 frame cada {VIDEO_FRAME_INTERVAL_SECONDS}s (máx {VIDEO_MAX_FRAMES} frames)")
     print(f"   • Documentos: {', '.join(SUPPORTED_DOCUMENT_FORMATS)}")
     print("="*70)
+    print("🔍 Búsqueda Semántica RAG: HABILITADA ✅")
     print("⏰ El servicio verifica nuevos registros cada 30 segundos")
     print("🔄 Para detener el servicio, presiona Ctrl+C")
     print("="*70 + "\n")
