@@ -31,7 +31,24 @@ if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, OPENAI_API_KEY]):
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Tipos de archivos soportados
+# Mapeo de MIME types a extensiones
+MIME_TYPE_MAP = {
+    # Imágenes
+    'image/jpeg': 'jpeg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    # Documentos
+    'application/pdf': 'pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.ms-excel': 'xls',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'application/vnd.ms-powerpoint': 'ppt',
+}
+
 SUPPORTED_IMAGE_FORMATS = ['png', 'jpeg', 'jpg', 'gif', 'webp']
 SUPPORTED_DOCUMENT_FORMATS = ['pdf', 'docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt']
 
@@ -47,13 +64,64 @@ def clean_url(url: str) -> str:
         print(f"⚠️ Error al limpiar URL: {e}")
         return url
 
-def get_file_extension(url: str) -> str:
+def get_file_extension_from_url(url: str) -> str:
     """Extrae la extensión del archivo desde la URL."""
     url_lower = url.lower()
     for ext in SUPPORTED_IMAGE_FORMATS + SUPPORTED_DOCUMENT_FORMATS:
         if f".{ext}" in url_lower:
             return ext
     return None
+
+def get_file_metadata_from_storage(url: str) -> dict:
+    """Obtiene metadata del archivo desde Supabase Storage."""
+    try:
+        # Extraer el path del archivo desde la URL
+        # URL format: https://...supabase.co/storage/v1/object/public/BUCKET_NAME/path/to/file.ext
+        if '/storage/v1/object/public/' in url:
+            parts = url.split('/storage/v1/object/public/')
+            if len(parts) > 1:
+                # Remover el bucket name y obtener el path
+                path_with_bucket = parts[1]
+                path_parts = path_with_bucket.split('/', 1)
+                if len(path_parts) > 1:
+                    file_path = path_parts[1]
+                    
+                    # Limpiar encoding de la URL
+                    file_path = unquote(file_path)
+                    
+                    # Consultar metadata desde Supabase Storage
+                    bucket = supabase.storage.from_(BUCKET_NAME)
+                    
+                    # Listar archivos y buscar el correcto
+                    # Nota: list() devuelve metadata incluyendo content_type
+                    files = bucket.list()
+                    
+                    # Buscar el archivo específico
+                    for file_info in files:
+                        if file_info.get('name') in file_path:
+                            return {
+                                'content_type': file_info.get('metadata', {}).get('mimetype'),
+                                'size': file_info.get('metadata', {}).get('size'),
+                                'name': file_info.get('name')
+                            }
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ No se pudo obtener metadata del storage: {e}")
+        return None
+
+def get_file_extension(url: str, mime_type: str = None) -> str:
+    """
+    Determina la extensión del archivo.
+    Prioridad: 1) MIME type, 2) Extensión de URL
+    """
+    # Intentar desde MIME type primero
+    if mime_type and mime_type in MIME_TYPE_MAP:
+        return MIME_TYPE_MAP[mime_type]
+    
+    # Fallback a extensión de URL
+    return get_file_extension_from_url(url)
 
 def download_file(url: str) -> bytes:
     """Descarga un archivo desde una URL y devuelve su contenido en bytes."""
@@ -70,20 +138,16 @@ def download_file(url: str) -> bytes:
 # 3. PROCESAMIENTO DE IMÁGENES
 # ----------------------------------------------------
 
-def get_image_mime_type(url: str) -> str:
+def get_image_mime_type(extension: str) -> str:
     """Determina el tipo MIME de la imagen basado en la extensión."""
-    url_lower = url.lower()
-    
-    if '.png' in url_lower:
-        return 'image/png'
-    elif '.jpg' in url_lower or '.jpeg' in url_lower:
-        return 'image/jpeg'
-    elif '.gif' in url_lower:
-        return 'image/gif'
-    elif '.webp' in url_lower:
-        return 'image/webp'
-    else:
-        return 'image/jpeg'
+    mime_map = {
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+        'webp': 'image/webp'
+    }
+    return mime_map.get(extension.lower(), 'image/jpeg')
 
 def analyze_image_with_ai(image_base64: str, file_type: str) -> str:
     """Usa GPT-4o para obtener una descripción textual de la imagen."""
@@ -121,7 +185,7 @@ def analyze_image_with_ai(image_base64: str, file_type: str) -> str:
         print(f"❌ Error en la API de OpenAI para la imagen: {e}")
         return None
 
-def process_image(url: str) -> str:
+def process_image(url: str, extension: str) -> str:
     """Procesa una imagen y retorna su análisis textual."""
     try:
         file_content = download_file(url)
@@ -132,7 +196,7 @@ def process_image(url: str) -> str:
         image_base64 = base64.b64encode(file_content).decode('utf-8')
         
         # Analizar con IA
-        file_type = get_image_mime_type(url)
+        file_type = get_image_mime_type(extension)
         description = analyze_image_with_ai(image_base64, file_type)
         
         return description
@@ -157,7 +221,7 @@ def extract_text_from_pdf(file_content: bytes) -> str:
             if page_text:
                 text_parts.append(page_text)
         
-        # Si PyPDF2 no extrajo texto, intentar con pdfplumber (mejor para PDFs complejos)
+        # Si PyPDF2 no extrajo texto, intentar con pdfplumber
         if not text_parts:
             with pdfplumber.open(BytesIO(file_content)) as pdf:
                 for page in pdf.pages:
@@ -181,7 +245,7 @@ def process_pdf(url: str) -> str:
         text = extract_text_from_pdf(file_content)
         
         if text and len(text.strip()) > 0:
-            return f"[CONTENIDO PDF]: {text[:3000]}"  # Limitar a 3000 caracteres
+            return f"[CONTENIDO PDF]: {text[:3000]}"
         else:
             return "[PDF sin texto extraíble - posiblemente escaneado]"
             
@@ -199,12 +263,10 @@ def extract_text_from_docx(file_content: bytes) -> str:
         doc = Document(BytesIO(file_content))
         text_parts = []
         
-        # Extraer párrafos
         for paragraph in doc.paragraphs:
             if paragraph.text.strip():
                 text_parts.append(paragraph.text)
         
-        # Extraer tablas
         for table in doc.tables:
             for row in table.rows:
                 row_text = " | ".join([cell.text.strip() for cell in row.cells])
@@ -249,9 +311,8 @@ def extract_text_from_xlsx(file_content: bytes) -> str:
             sheet = workbook[sheet_name]
             text_parts.append(f"\n=== HOJA: {sheet_name} ===")
             
-            # Extraer hasta 100 filas por hoja
             for row_idx, row in enumerate(sheet.iter_rows(values_only=True), 1):
-                if row_idx > 100:  # Limitar filas
+                if row_idx > 100:
                     text_parts.append("[... contenido truncado ...]")
                     break
                 
@@ -296,7 +357,6 @@ def extract_text_from_pptx(file_content: bytes) -> str:
         for slide_idx, slide in enumerate(presentation.slides, 1):
             text_parts.append(f"\n=== DIAPOSITIVA {slide_idx} ===")
             
-            # Extraer texto de todas las formas
             for shape in slide.shapes:
                 if hasattr(shape, "text") and shape.text.strip():
                     text_parts.append(shape.text)
@@ -336,7 +396,7 @@ def process_file(url: str, file_extension: str) -> str:
     
     # Imágenes
     if file_extension in SUPPORTED_IMAGE_FORMATS:
-        return process_image(url)
+        return process_image(url, file_extension)
     
     # PDFs
     elif file_extension == 'pdf':
@@ -369,7 +429,7 @@ def create_and_upload_embedding(content: str, record_id: int):
         # 1. Generar Embedding
         print(f"   [ID {record_id}] Generando embedding...")
         embedding_response = openai_client.embeddings.create(
-            input=content,
+            input=content[:8000],  # Limitar a 8000 caracteres para evitar límites de tokens
             model="text-embedding-3-small"
         )
         embedding_vector = embedding_response.data[0].embedding
@@ -397,7 +457,9 @@ def create_and_upload_embedding(content: str, record_id: int):
 
 def main_processor():
     """Procesa mensajes pendientes de vectorización."""
-    print("\n--- 🚀 Iniciando Proceso de Vectorización y Análisis de Documentos ---")
+    print("\n" + "="*70)
+    print("🚀 Iniciando Proceso de Vectorización y Análisis de Documentos")
+    print("="*70)
 
     try:
         # 1. Buscar registros sin vectorizar
@@ -416,16 +478,23 @@ def main_processor():
         error_count = 0
         skipped_count = 0
         
-        for record in pending_records:
+        for idx, record in enumerate(pending_records, 1):
             record_id = record.get('id')
             final_content = record.get('contenido_texto', '') or ""
 
-            print(f"\n📝 Procesando ID {record_id}...")
+            print(f"\n{'─'*70}")
+            print(f"📝 [{idx}/{len(pending_records)}] Procesando ID {record_id}...")
 
-            # A. Si tiene archivo adjunto (imagen, PDF, Office)
+            # A. Si tiene archivo adjunto
             if record.get('url_storage'):
                 file_url = record['url_storage']
-                file_extension = get_file_extension(file_url)
+                
+                # Intentar obtener metadata del storage
+                # metadata = get_file_metadata_from_storage(file_url)
+                # mime_type = metadata.get('content_type') if metadata else None
+                
+                # Por ahora usar extensión de URL
+                file_extension = get_file_extension_from_url(file_url)
                 
                 if file_extension:
                     print(f"   [ID {record_id}] 📎 Procesando archivo adjunto...")
@@ -452,7 +521,12 @@ def main_processor():
                 print(f"   [ID {record_id}] ⚠️ Contenido vacío. Saltando.")
                 skipped_count += 1
 
-        print(f"\n📊 Resumen: {processed_count} procesados, {error_count} errores, {skipped_count} saltados")
+        print(f"\n{'='*70}")
+        print(f"📊 RESUMEN DEL CICLO:")
+        print(f"   ✅ Procesados: {processed_count}")
+        print(f"   ❌ Errores: {error_count}")
+        print(f"   ⏭️  Saltados: {skipped_count}")
+        print(f"{'='*70}")
 
     except Exception as e:
         print(f"❌ Error en main_processor: {e}")
@@ -464,29 +538,39 @@ def main_processor():
 # ----------------------------------------------------
 
 if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("🔧 SERVICIO DE VECTORIZACIÓN MULTI-FORMATO")
     print("="*70)
-    print("🔧 Servicio de Vectorización y Análisis Multi-Formato iniciado")
-    print(f"🌐 Conectado a Supabase: {SUPABASE_URL}")
+    print(f"🌐 Supabase URL: {SUPABASE_URL}")
     print(f"📁 Bucket: {BUCKET_NAME}")
     print(f"📄 Formatos soportados:")
     print(f"   • Imágenes: {', '.join(SUPPORTED_IMAGE_FORMATS)}")
     print(f"   • Documentos: {', '.join(SUPPORTED_DOCUMENT_FORMATS)}")
     print("="*70)
+    print("⏰ El servicio verifica nuevos registros cada 30 segundos")
+    print("🔄 Para detener el servicio, presiona Ctrl+C")
+    print("="*70 + "\n")
     
     # Bucle continuo para servicio 24/7
     cycle_count = 0
     while True:
         try:
             cycle_count += 1
-            print(f"\n🔄 Ciclo #{cycle_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"\n🔄 Ciclo #{cycle_count} - {timestamp}")
+            
             main_processor()
-            print(f"\n😴 Durmiendo 30 segundos antes de la siguiente búsqueda...")
+            
+            print(f"\n😴 Esperando 30 segundos antes del siguiente ciclo...")
             time.sleep(30)
+            
         except KeyboardInterrupt:
-            print("\n👋 Servicio detenido por el usuario")
+            print("\n\n" + "="*70)
+            print("👋 Servicio detenido por el usuario")
+            print("="*70)
             break
         except Exception as e:
-            print(f"❌ Error crítico: {e}")
+            print(f"\n❌ Error crítico en el ciclo principal: {e}")
             import traceback
             traceback.print_exc()
             print("⏰ Esperando 60 segundos antes de reintentar...")
