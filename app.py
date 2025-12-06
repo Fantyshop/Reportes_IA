@@ -17,6 +17,10 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 BUCKET_NAME = os.environ.get("SUPABASE_BUCKET", "whatsapp-media")
 
+# Validar variables de entorno
+if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, OPENAI_API_KEY]):
+    raise ValueError("Faltan variables de entorno necesarias. Verifica SUPABASE_URL, SUPABASE_SERVICE_KEY y OPENAI_API_KEY")
+
 # Inicializar clientes
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -37,7 +41,7 @@ def encode_image(image_url: str):
     try:
         # Nota: La URL debe ser accesible (pública o usando la clave de servicio en la petición)
         response = requests.get(image_url, timeout=10)
-        response.raise_for_status() # Lanza un error para códigos de estado HTTP malos
+        response.raise_for_status()  # Lanza un error para códigos de estado HTTP malos
 
         # Codificar binario a Base64
         return base64.b64encode(response.content).decode('utf-8')
@@ -57,7 +61,7 @@ def analyze_and_get_description(image_base64: str, file_type: str) -> str:
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o", # O el modelo multimodal de tu preferencia (Ej: Claude 3.5 Sonnet)
+            model="gpt-4o",
             messages=[
                 {
                     "role": "user",
@@ -83,85 +87,95 @@ def analyze_and_get_description(image_base64: str, file_type: str) -> str:
 def create_and_upload_embedding(content: str, record_id: int):
     """Genera el embedding y actualiza el registro en Supabase."""
     
-    # 1. Generar Embedding
-    response = openai_client.embeddings.create(
-        input=content,
-        model="text-embedding-3-small" # Un modelo de 1536 dimensiones, muy eficiente y barato
-    )
-    embedding_vector = response.data[0].embedding
+    try:
+        # 1. Generar Embedding
+        embedding_response = openai_client.embeddings.create(
+            input=content,
+            model="text-embedding-3-small"
+        )
+        embedding_vector = embedding_response.data[0].embedding
 
-    # 2. Actualizar Supabase (usando la notación de array de Python)
-    response = supabase.from('mensajes_analisis').update(
-        {
+        # 2. Actualizar Supabase
+        update_response = supabase.from_('mensajes_analisis').update({
             'embedding': embedding_vector,
-            # Campo de control para saber que ya fue procesado
-            'procesado_ia': True 
-        }
-    ).eq('id', record_id).execute()
+            'procesado_ia': True
+        }).eq('id', record_id).execute()
 
-    if response.data:
-        print(f"✔️ Actualizado ID {record_id} con embedding.")
-    else:
-        print(f"❌ Error al actualizar ID {record_id}.")
+        if update_response.data:
+            print(f"✔️ Actualizado ID {record_id} con embedding.")
+            return True
+        else:
+            print(f"❌ Error al actualizar ID {record_id}.")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error procesando ID {record_id}: {e}")
+        return False
 
 # ----------------------------------------------------
 # 3. LÓGICA PRINCIPAL DEL PROCESO
 # ----------------------------------------------------
 
 def main_processor():
+    """Procesa mensajes pendientes de vectorización."""
     print("--- 🚀 Iniciando Proceso de Vectorización y OCR ---")
 
-    # 1. Buscar registros sin vectorizar ni procesar
-    # Agrega 'procesado_ia' en tu tabla para evitar reprocesar
-    # Asume que ya tienes una columna `procesado_ia` BOOLEAN en `mensajes_analisis`
-    # Si no la tienes, puedes buscar donde 'embedding' es NULL
-    response = supabase.from('mensajes_analisis').select("*").is_('embedding', None).order('fecha_hora', desc=False).limit(50).execute()
-    
-    pending_records = response.data
-
-    if not pending_records:
-        print("✅ No hay nuevos registros para procesar.")
-        return
-
-    print(f"🔎 Encontrados {len(pending_records)} registros pendientes.")
-
-    for record in pending_records:
-        record_id = record['id']
-        final_content = record['contenido_texto'] or "" # Empezar con el texto crudo
-
-        # A. Si es una imagen, hacer OCR Multimodal
-        if record['es_imagen'] and record['url_storage']:
-            print(f"   [ID {record_id}] Procesando imagen...")
-            
-            # Nota: Necesitas saber el tipo de archivo (mime-type)
-            file_type = "image/jpeg" # Asumir JPEG o inferir del nombre/metadata
-            
-            base64_img = encode_image(record['url_storage'])
-            
-            if base64_img:
-                description = analyze_and_get_description(base64_img, file_type)
-                # Combinar la descripción de la imagen con el texto del mensaje original
-                final_content = f"{final_content}\n[ANÁLISIS DE IMAGEN]: {description}"
-                print(f"   [ID {record_id}] Descripción: {description[:40]}...")
-
-
-        # B. Procesamiento de Texto (Chunking) y Vectorización
+    try:
+        # 1. Buscar registros sin vectorizar
+        query_response = supabase.from_('mensajes_analisis').select("*").is_('embedding', 'null').order('fecha_hora', desc=False).limit(50).execute()
         
-        # Opcional: Si el texto es muy largo, LangChain lo divide
-        # En este caso de chats cortos, lo simplificamos a vectorizar el contenido unificado
-        
-        if final_content:
-            create_and_upload_embedding(final_content, record_id)
-        else:
-             print(f"   [ID {record_id}] Contenido vacío. Saltando.")
+        pending_records = query_response.data if query_response.data else []
 
+        if not pending_records:
+            print("✅ No hay nuevos registros para procesar.")
+            return
 
-# Si vas a correr esto como un Cron Job o un servicio "Always On"
+        print(f"🔎 Encontrados {len(pending_records)} registros pendientes.")
+
+        # 2. Procesar cada registro
+        for record in pending_records:
+            record_id = record.get('id')
+            final_content = record.get('contenido_texto', '') or ""
+
+            # A. Si es una imagen, hacer OCR Multimodal
+            if record.get('es_imagen') and record.get('url_storage'):
+                print(f"   [ID {record_id}] Procesando imagen...")
+                
+                file_type = "image/jpeg"  # Asumir JPEG o inferir del nombre/metadata
+                base64_img = encode_image(record['url_storage'])
+                
+                if base64_img:
+                    description = analyze_and_get_description(base64_img, file_type)
+                    final_content = f"{final_content}\n[ANÁLISIS DE IMAGEN]: {description}"
+                    print(f"   [ID {record_id}] Descripción: {description[:40]}...")
+
+            # B. Procesamiento de Texto y Vectorización
+            if final_content:
+                create_and_upload_embedding(final_content, record_id)
+            else:
+                print(f"   [ID {record_id}] Contenido vacío. Saltando.")
+
+    except Exception as e:
+        print(f"❌ Error en main_processor: {e}")
+
+# ----------------------------------------------------
+# 4. PUNTO DE ENTRADA
+# ----------------------------------------------------
+
 if __name__ == "__main__":
-    # La mejor práctica en Railway es correr esto en un bucle si es un servicio 24/7
-    # O usar una función Serverless para correrlo una vez cada N minutos.
-    # Para un servicio continuo:
+    print("🔧 Servicio de Vectorización iniciado")
+    print(f"🌐 Conectado a Supabase: {SUPABASE_URL}")
+    
+    # Bucle continuo para servicio 24/7
     while True:
-        main_processor()
-        print("😴 Durmiendo 30 segundos antes de la siguiente búsqueda...")
-        time.sleep(30)
+        try:
+            main_processor()
+            print("😴 Durmiendo 30 segundos antes de la siguiente búsqueda...")
+            time.sleep(30)
+        except KeyboardInterrupt:
+            print("\n👋 Servicio detenido por el usuario")
+            break
+        except Exception as e:
+            print(f"❌ Error crítico: {e}")
+            print("⏰ Esperando 60 segundos antes de reintentar...")
+            time.sleep(60)
